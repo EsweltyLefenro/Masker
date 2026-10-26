@@ -1,7 +1,14 @@
 import threading
 import re
 import sys
+import os
+import queue
 from pathlib import Path
+
+# Требуем полностью локальную загрузку модели.
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 import torch
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -10,14 +17,12 @@ from transformers import AutoTokenizer
 from transformers.pipelines.token_classification import TokenClassificationPipeline
 
 # Предкомпилированные шаблоны ───────────────────────────────────
-_PHONE_RE    = re.compile(r"(?:\+7|8)?[\s\-]?\(?\d{3,4}\)?[\s\-]?\d{2,3}[\s\-]?\d{2}[\s\-]?\d{2}")
+_PHONE_RE    = re.compile(r"(?<!\w)(?:\+7|8)?[\s\-]?\(?\d{3,4}\)?[\s\-]?\d{2,3}[\s\-]?\d{2}[\s\-]?\d{2}(?!\w)")
 _PASSPORT_RE = re.compile(r"\b\d{4}[-\s]?\d{6}\b|\b\d{2}[-\s]?\d{2}[-\s]?\d{6}\b")
-_MONEY_RE    = re.compile(r"\b\d{1,3}(?:[\s ]?\d{3})*(?:[\s ]?(?:руб(?:лей)?|\u20BD))\b")
+_MONEY_RE    = re.compile(r"\b\d{1,3}(?:[\s ]?\d{3})*(?:[\s ]?(?:руб(?:лей)?|\u20BD))(?!\w)")
 _EMAIL_RE    = re.compile(r"\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,}\b")
 # ───────────────────────────────────────────────────────────────
 
-import os
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 _ner_pipeline = None
 
@@ -55,15 +60,14 @@ def load_ner_pipeline():
 
 def mask_entities(text, entities):
     """
-    Быстрая маскировка: собираем все (start, end, repl) и один раз проходим по тексту.
+    Маскируем NER-сущности по исходным позициям, объединяя пересечения.
+    Одна сущность может быть найдена в нескольких перекрывающихся окнах.
     """
-    # Собираем список замен
     repls = []
-    for ent in sorted(entities, key=lambda x: x["start"]):
+    for ent in entities:
         label = ent["entity_group"]
-        word  = ent.get("word", "").lower()
+        word = ent.get("word", "").lower()
 
-        # Логика выбора repl точно как у тебя
         if label == "ORG":
             if re.search(r"\b(улица|проспект|шоссе|аллея|переулок|площадь)\b", word):
                 repl = "<адрес>"
@@ -82,13 +86,24 @@ def mask_entities(text, entities):
         else:
             continue
 
-        # Запоминаем замену без смещения
-        repls.append((ent["start"], ent["end"], repl))
+        start, end = ent["start"], ent["end"]
+        if not 0 <= start < end <= len(text):
+            continue
+        repls.append((start, end, repl))
 
-    # Один проход по исходному тексту
+    # При равном начале сначала обрабатываем более длинный диапазон.
+    repls.sort(key=lambda item: (item[0], -item[1]))
+    merged = []
+    for start, end, repl in repls:
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end, previous_repl = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end), previous_repl)
+        else:
+            merged.append((start, end, repl))
+
     result = []
     last = 0
-    for start, end, repl in repls:
+    for start, end, repl in merged:
         result.append(text[last:start])
         result.append(repl)
         last = end
@@ -101,38 +116,18 @@ def apply_regex_masking(text):
     text = _PASSPORT_RE.sub("<паспорт>", text)
     text = _MONEY_RE.sub("<сумма>", text)
     text = _EMAIL_RE.sub("<email>", text)
-    # ==== расширенная маскировка улиц/проспектов/переулков и т.п. ====
-    # Захватываем «ул. 60 лет Октября», «улице Гагарина», «улицы Пушкина» и т.д.
-    text = re.sub(
-        r"(?i)\b(?:ул\.?|улиц[ауыеёй]|улице|улицу|улицей)\s+[^,;()]+",
-        "<адрес>",
-        text
+    # Маскируем названия улиц, не захватывая следующие предложения.
+    # Поддержка: "улица Ленина", "ул. Большая Садовая", "улица 60 лет Октября".
+    street_prefix = (
+        r"(?i:\b(?:ул\.?|улиц[ауыеёй]|пр\.?|проспект(?:а|е|у|ом)?|пр-кт|пр-т|"
+        r"пер\.?|переулок(?:а|е|у|ом)?|пер-ул|пл\.?|площадь|площади|площадью|"
+        r"ш\.?|шоссе|алле[яиею]))"
     )
-    # Захватываем «пр. Мира», «проспекте Мира», «проспекта Мира» и т.п.
-    text = re.sub(
-        r"(?i)\b(?:пр\.?|проспект|пр-кт|пр-т)\s+[^,;()]+",
-        "<адрес>",
-        text
+    street_name = (
+        r"(?:\d{1,4}(?:[-–][ая])?(?:\s+лет)?\s+)?"
+        r"[А-ЯЁ][а-яё-]+(?:\s+[А-ЯЁ][а-яё-]+){0,3}"
     )
-    # Захватываем «пер. Пушкина», «переулок Пушкина» и т.п.
-    text = re.sub(
-        r"(?i)\b(?:пер\.?|переулок|пер-ул)\s+[^,;()]+",
-        "<адрес>",
-        text
-    )
-    # Захватываем «пл. Ленина», «площади Ленина» и т.п.
-    text = re.sub(
-        r"(?i)\b(?:пл\.?|площадь|площади|площадью)\s+[^,;()]+",
-        "<адрес>",
-        text
-    )
-    # Захватываем «ш. Энтузиастов», «шоссе Энтузиастов» и т.п.
-    text = re.sub(
-        r"(?i)\b(?:ш\.?|шоссе)\s+[^,;()]+",
-        "<адрес>",
-        text
-    )
-    # ==== конец расширенной маскировки улиц ====
+    text = re.sub(fr"{street_prefix}\s+{street_name}", "<адрес>", text)
 
     text = re.sub(r"\b\d{1,2}[./]\d{1,2}[./]\d{4}\b", "<дата>", text)
     # Маскируем даты со словами месяца (пример: 17 августа 1993 года)
@@ -142,9 +137,6 @@ def apply_regex_masking(text):
         text,
         flags = re.IGNORECASE
     )
-    street_forms = r"(улиц[ауыеёй]|проспект[ауыом]?|шоссе|переулк[ауыом]?|алле[яюеёйи]|площад[ьиюеёй])"
-    text = re.sub(fr"{street_forms}\s+[а-яёa-z0-9\-]+", "<адрес>", text, flags=re.IGNORECASE)
-    text = re.sub(fr"[а-яёa-z0-9\-]+\s+{street_forms}", "<адрес>", text, flags=re.IGNORECASE)
     text = re.sub(r"(дом|д\.)\s*\d+[а-я]?", "<адрес>", text, flags=re.IGNORECASE)
     text = re.sub(r"\d+[а-я]?\s*(дом|д\.)", "<адрес>", text, flags=re.IGNORECASE)
     text = re.sub(r"(квартира|кв\.?|кв)\s*\d+[а-я]?", "<адрес>", text, flags=re.IGNORECASE)
@@ -275,7 +267,8 @@ def run_gui():
                 text = f.read()
             pipeline = get_ner_pipeline()
             result = anonymize_text(text, pipeline)
-            output_path = file_path.replace(".txt", "-masked.txt")
+            input_path = Path(file_path)
+            output_path = input_path.with_name(f"{input_path.stem}-masked.txt")
             with open(output_path, "w", encoding="utf-8") as f:
                 f.write(result)
             messagebox.showinfo("Успех", f"Маскированный файл сохранён как:\n{output_path}")
@@ -284,18 +277,36 @@ def run_gui():
 
     button.config(command=select_file)
 
+    # Передаём результат из фонового потока в главный поток Tkinter.
+    model_load_results = queue.Queue()
+
     def load_model_background():
-        # здесь загрузится модель (лениво или quantized), как раньше
-        get_ner_pipeline()
-        # переключаем UI в main thread
-        root.after(0, on_model_loaded)
+        try:
+            get_ner_pipeline()
+        except Exception as exc:
+            model_load_results.put((False, str(exc)))
+        else:
+            model_load_results.put((True, None))
 
     def on_model_loaded():
         status.config(text="Модель загружена. Нажмите «Выбрать файл» ниже.")
         button.config(state="normal")
 
-    # запускаем загрузку в фоне
+    def check_model_load():
+        try:
+            success, error = model_load_results.get_nowait()
+        except queue.Empty:
+            root.after(100, check_model_load)
+            return
+
+        if success:
+            on_model_loaded()
+        else:
+            status.config(text="Ошибка загрузки модели.")
+            messagebox.showerror("Ошибка загрузки модели", error)
+
     threading.Thread(target=load_model_background, daemon=True).start()
+    root.after(100, check_model_load)
 
     root.mainloop()
 
